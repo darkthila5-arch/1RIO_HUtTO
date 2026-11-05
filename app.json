@@ -1,0 +1,17 @@
+{
+  "name": "RIO X MD",
+  "description": "Multi-session WhatsApp bot with pair-code website",
+  "stack": "container",
+  "env": {
+    "OWNER_NUMBER": { "description": "Your number, country code, digits only" },
+    "MONGO_URL": { "description": "MongoDB Atlas URL. REQUIRED on Heroku (no persistent disk, sessions are kept here)" },
+    "WEB_SECRET": { "generator": "secret" },
+    "ADMIN_USER": { "value": "admin" },
+    "ADMIN_PASSWORD": { "description": "10+ characters, turns on /admin" },
+    "BOT_NAME": { "value": "RIO X MD" },
+    "PREFIX": { "value": "." },
+    "TRUST_PROXY": { "value": "1" },
+    "MAX_SESSIONS": { "value": "20" }
+  },
+  "formation": { "web": { "quantity": 1, "size": "basic" } }
+}

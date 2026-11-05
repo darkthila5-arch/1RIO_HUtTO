@@ -1,0 +1,39 @@
+# VPS: docker compose up -d --build        (or run ./install-vps.sh)
+# HTTPS with your own domain: set DOMAIN, BIND=127.0.0.1, TRUST_PROXY=1 in .env, then
+#   docker compose --profile https up -d --build
+services:
+  bot:
+    build: .
+    container_name: rio-x-md
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PORT: "3000"
+      SESSION_DIR: /data/sessions
+      TRUST_PROXY: ${TRUST_PROXY:-0}
+    ports:
+      - "${BIND:-0.0.0.0}:3000:3000"
+    volumes:
+      - rio-data:/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  caddy:
+    image: caddy:2
+    profiles: ["https"]
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    depends_on: [bot]
+
+volumes:
+  rio-data:
+  caddy-data:
