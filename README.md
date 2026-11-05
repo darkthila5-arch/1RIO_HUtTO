@@ -37,14 +37,64 @@ npm start
 Open `http://localhost:3000`, enter your number (digits only, with country code) and press **Generate Pair Code**.
 Needs Node 20+. For downloads install `ffmpeg`; yt-dlp is downloaded automatically. For real call answering also build the Go service (see below).
 
-## Deploy on Render (Docker)
-The repo ships a `Dockerfile` (Node bot + Go call service + ffmpeg + git) and `render.yaml` with `runtime: docker`.
-1. Push the repo to GitHub (never commit `.env`, `sessions/`).
-2. Render → **New → Blueprint** (or **New → Web Service → Language: Docker**), plan **Starter** or higher.
-3. Set the environment variables below. Add a **persistent disk** mounted at `/var/data` and set `SESSION_DIR=/var/data/sessions`.
-4. Health check path: `/health`.
-Important: a service created as "Node" cannot be switched to Docker. Create a new Docker service, copy the variables, then delete the old one (two services on the same sessions disconnect each other).
+## Deploy
+Every option uses the same `Dockerfile` (Node bot + ffmpeg + Go call service). Push the repo to GitHub first (`.env` and `sessions/` are in `.gitignore`, never commit them).
+All variables are listed in `.env.example` and in the table below. Minimum: `OWNER_NUMBER`, `WEB_SECRET`, `ADMIN_PASSWORD`.
+
+| | Sessions survive a redeploy? | Real call answering | Note |
+|---|---|---|---|
+| Render | Yes, with the disk in `render.yaml` | Yes | Starter plan or higher (disk) |
+| Railway | Yes, with a Volume | Yes | Needs a Volume |
+| VPS | Yes (Docker volume) | Yes | Cheapest for many numbers |
+| Heroku | Only with `MONGO_URL` | No (needs a disk) | Use Basic, Eco dynos sleep |
+
+### Render
+1. New -> **Blueprint** -> pick the repo (`render.yaml` is read; or New -> Web Service -> Language: Docker). Plan **Starter** or higher.
+2. Set `ADMIN_PASSWORD`, `OWNER_NUMBER`, `PUBLIC_URL`. The persistent disk is mounted at `/var/data` and `SESSION_DIR=/var/data/sessions` is already set. Health check path: `/health`.
+
+A service created as "Node" cannot be switched to Docker. Create a new Docker service, copy the variables, then delete the old one (two services on the same sessions disconnect each other).
 Without a disk, files are wiped on every redeploy. With `MONGO_URL` the WhatsApp sessions, settings and saved call clips are also kept in MongoDB. The call-service link (`SESSION_DIR/_callbot`) needs the disk.
+
+### Railway
+1. New Project -> Deploy from GitHub repo (`railway.json` makes it build the Dockerfile).
+2. Variables: `OWNER_NUMBER`, `WEB_SECRET`, `ADMIN_PASSWORD`, `SESSION_DIR=/data/sessions`, `TRUST_PROXY=1`.
+3. Add a **Volume** with mount path `/data`.
+4. Settings -> Networking -> **Generate Domain**. `PORT` is set by Railway.
+
+### Heroku (container stack)
+```bash
+heroku create your-app-name --stack container
+heroku config:set OWNER_NUMBER=94770000000 WEB_SECRET=$(openssl rand -hex 32) ADMIN_PASSWORD=change-me-long \
+  MONGO_URL="mongodb+srv://..." TRUST_PROXY=1
+git push heroku main
+heroku ps:scale web=1 -a your-app-name
+```
+Heroku wipes files on every restart, so `MONGO_URL` (MongoDB Atlas, allow `0.0.0.0/0`) is required, otherwise every number must be linked again. Optional: `heroku labs:enable runtime-dyno-metadata` so the site address is detected automatically (or set `PUBLIC_URL`).
+
+### VPS (Ubuntu / Debian) with Docker
+```bash
+git clone <your-repo> rio && cd rio
+bash install-vps.sh        # installs Docker, creates .env with random secrets, builds and starts
+```
+Open `http://SERVER_IP:3000` (allow port 3000 in the firewall). Logs: `docker compose logs -f bot`. Update: `git pull && docker compose up -d --build`.
+
+HTTPS with your own domain (point the domain's A record to the server first): in `.env` set `DOMAIN=your.domain`, `BIND=127.0.0.1`, `TRUST_PROXY=1`, then
+```bash
+docker compose --profile https up -d --build
+```
+
+### VPS without Docker (pm2)
+```bash
+sudo apt install -y ffmpeg nodejs npm   # Node 20+
+npm ci --omit=dev
+cp .env.example .env && nano .env       # TRUST_PROXY=0 if there is no Nginx in front
+npm i -g pm2 && pm2 start ecosystem.config.cjs && pm2 save && pm2 startup
+```
+Real call answering is not available here (the Go service is only built by the Dockerfile).
+
+### Important
+- Never run two copies with the same linked numbers (for example an old and a new service): they disconnect each other.
+- `TRUST_PROXY=1` only when exactly one proxy is in front. On a plain VPS with port 3000 open use `0`, otherwise login lockouts can be dodged with a fake `X-Forwarded-For`.
 
 ## Project layout and adding commands
 ```
@@ -74,16 +124,21 @@ Optional fields: `owner: true` (owner only), `hidden: true` (silent for everyone
 | `MODE` | `public` (default) or `private` (only the owner can use the bot). `.mode` changes it per session. |
 | `CARD_URL` | Link opened by the DP card on replies. |
 | `MONGO_URL`, `MONGO_DB` | MongoDB Atlas connection. Sessions survive redeploys. Allow `0.0.0.0/0` in Atlas network access. |
-| `SESSION_DIR` | Where sessions and settings are stored (`/var/data/sessions` on Render). |
+| `SESSION_DIR` | Where sessions and settings are stored (`/var/data/sessions` on Render, `/data/sessions` on Railway). |
 | `MAX_SESSIONS` | Maximum linked numbers (default 20). |
+| `PORT` | Web port (default 3000). Render, Railway and Heroku set it for you. |
+| `TRUST_PROXY` | How many proxies sit in front of the site (default `1`). Use `0` on a plain VPS with port 3000 open. Login lockouts and rate limits depend on it. |
+| `PAIRING_REQUIRE_KEY` | `true` = only people with `PAIRING_API_KEY` can link a number (default `false`, pairing is public). |
+| `MAX_DL_JOBS` | Downloads / yt-dlp runs at the same time (default 3). |
+| `DOMAIN`, `BIND` | VPS compose only: domain for automatic HTTPS (Caddy) and the address port 3000 binds to (`127.0.0.1` when Caddy is used). |
 | `MAX_DL_MB` | Download size limit (default 50). |
 | `YTDLP_PATH`, `YTDLP_COOKIES` | yt-dlp location / YouTube cookies when YouTube asks for a bot check. |
 | `CALLBOT_DIR`, `CALLBOT_PORT` | Optional, call service data folder / localhost port (8099). |
-| `PUBLIC_URL` | Public address of the site (for example `https://your-app.onrender.com`). Used in the web password message. Render's own `RENDER_EXTERNAL_URL` is used when this is empty. |
+| `PUBLIC_URL` | Public address of the site (for example `https://your-domain.com`). Used in the web password message. `RENDER_EXTERNAL_URL` (Render), `RAILWAY_PUBLIC_DOMAIN` (Railway) or `HEROKU_APP_DEFAULT_DOMAIN_NAME` (Heroku) is used when this is empty. |
 | `WEB_SECRET` | Long random text used to sign web logins. Set it, otherwise everyone is logged out on each restart. |
 | `ADMIN_USER`, `ADMIN_PASSWORD` | Login for `/admin` (user defaults to `admin`). The admin site stays off unless the password has 10+ characters. |
 | `TIMEZONE` | Greeting and clock time zone (default `Asia/Colombo`). |
-| `TIKTOK_RAPIDAPI_KEY` | Your RapidAPI key for `.tts` (ScrapTik, subscribe on rapidapi.com, the free plan is enough). **Never put it in the repo or share it: set it only in Render's Environment tab.** |
+| `TIKTOK_RAPIDAPI_KEY` | Your RapidAPI key for `.tts` (ScrapTik, subscribe on rapidapi.com, the free plan is enough). **Never put it in the repo or share it: set it only in your host's environment variables.** |
 | `TIKTOK_SEARCH_URL` | Optional: any other JSON search API for `.tts`. Paste the URL from its "Code snippet" and write `{q}` where the search words go. RapidAPI URLs get the key and host headers added automatically. |
 | `TIKTOK_RAPIDAPI_PATH` | Optional: path of a `tiktok-scraper20` search endpoint, only if its automatic path guess fails. |
 | `NEWS_LANG` | `si` (default, Sinhala) or `en`: language of the news feeds. |
