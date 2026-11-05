@@ -1,0 +1,8 @@
+node_modules
+sessions
+.env
+.git
+*.log
+bin
+tests
+QA_REPORT.md
