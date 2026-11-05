@@ -1,0 +1,282 @@
+// .tts <words>  ->  TikTok search shown as a swipeable card carousel (image + title + 3 buttons).
+//   VIDEO -> .ttdl <link>  sends the video straight away      AUDIO -> .ttmp3 <link>  sends the sound
+//   MORE  -> .tt <link>    opens the normal Video / Audio / Document menu
+import path from 'node:path';
+import { FOOTER_LINE } from '../lib/brand.js';
+import { BOT_NAME, PREFIX, ROOT_DIR, USE_BUTTONS, sleep } from '../lib/config.js';
+import { qr } from '../lib/menu.js';
+import { sendCards } from '../lib/carousel.js';
+import { MAX_DL_BYTES, NAGS, fetchBuffer, parseUrl, tikwm, tooBigText } from '../lib/downloader.js';
+
+const MAX_CARDS = 8;
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+
+const abs = (v) => (v ? (v.startsWith('/') ? `https://www.tikwm.com${v}` : v) : null);
+const httpUrl = (v) => { const u = abs(typeof v === 'string' ? v : ''); return /^https?:\/\//i.test(u || '') ? u : null; };
+const clip = (s, n) => { const t = String(s || '').replace(/\s+/g, ' ').trim(); return t.length > n ? `${t.slice(0, n - 1)}…` : t; };
+
+const coverOf = (c) => (typeof c === 'string' ? c : c?.url_list?.[0] || null); // ScrapTik sends { url_list: [...] }
+
+// Turns the different reply shapes of the search providers into one list.
+function normalize(items) {
+  const out = [];
+  for (const raw of Array.isArray(items) ? items : []) {
+    const it = raw?.aweme_info || raw?.item || raw?.video_info || raw; // some APIs (ScrapTik) wrap every video in aweme_info
+    if (!it || typeof it !== 'object') continue;
+    const id = it.video_id || it.aweme_id || it.id;
+    const a = it.author;
+    const handle = (typeof a === 'object' ? a?.unique_id || a?.uniqueId || a?.username : '') || it.unique_id || it.username || '';
+    const author = (typeof a === 'string' ? a : a?.nickname || a?.name || handle) || '';
+    const url = it.url || it.share_url || it.link || (id ? `https://www.tiktok.com/@${handle || 'user'}/video/${id}` : '');
+    if (!/^https?:\/\/[^ ]*tiktok\.com\//i.test(url)) continue;
+    out.push({
+      title: it.title || it.desc || it.description || it.caption || '',
+      author, handle,
+      cover: abs(coverOf(it.cover) || coverOf(it.origin_cover) || coverOf(it.thumbnail) || coverOf(it.thumb) || coverOf(it.video?.cover) || coverOf(it.video?.origin_cover) || coverOf(it.dynamic_cover)),
+      plays: it.play_count ?? it.plays ?? it.stats?.playCount ?? it.statistics?.play_count,
+      video: httpUrl(it.hdplay) || httpUrl(it.play) || httpUrl(it.video_url) || httpUrl(it.nowm),       // direct no-watermark file, when the provider sends it
+      audio: httpUrl(it.music) || httpUrl(it.music_info?.play) || httpUrl(it.audio),
+      url
+    });
+    if (out.length >= MAX_CARDS) break;
+  }
+  return out;
+}
+// Finds the list of videos wherever the provider put it (data.videos, meta, result.search_data, ...).
+let lastRaw = null; // raw reply of the provider being tried (shown in the error log)
+function pick(j, depth = 0) {
+  if (depth === 0) lastRaw = j;
+  if (Array.isArray(j)) return j;
+  if (!j || typeof j !== 'object' || depth > 3) return [];
+  for (const v of Object.values(j)) {
+    if (Array.isArray(v) && v.some((x) => x && typeof x === 'object' && (x.video_id || x.aweme_id || x.id || x.url || x.play || x.aweme_info || x.item))) return v;
+  }
+  for (const v of Object.values(j)) { const r = pick(v, depth + 1); if (r.length) return r; }
+  return [];
+}
+
+async function getJson(url, opts = {}) {
+  const res = await fetch(url, { ...opts, signal: AbortSignal.timeout(15000) });
+  const text = await res.text();
+  try { return JSON.parse(text); } catch { throw new Error(`not JSON (HTTP ${res.status})`); }
+}
+const BROWSER = { 'user-agent': UA, accept: 'application/json, text/plain, */*', 'accept-language': 'en-US,en;q=0.9' };
+const form = (q) => new URLSearchParams({ keywords: q, count: '12', cursor: '0', hd: '1' });
+
+// Web search fallback: Bing finds tiktok.com video links, then TikTok's own oEmbed gives each one's title + thumbnail.
+function extractTikTokLinks(html) {
+  const found = new Set();
+  const scan = (t) => {
+    for (const m of t.matchAll(/(?:https?:\/\/)?(?:www\.)?tiktok\.com\/@([\w.\-]+)\/video\/(\d+)/g)) found.add(`https://www.tiktok.com/@${m[1]}/video/${m[2]}`);
+    for (const m of t.matchAll(/tiktok\.com\s*(?:›|&rsaquo;|&#8250;)\s*(@[\w.\-]+)\s*(?:›|&rsaquo;|&#8250;)\s*video\s*(?:›|&rsaquo;|&#8250;)\s*(\d+)/g)) found.add(`https://www.tiktok.com/${m[1]}/video/${m[2]}`); // Bing's breadcrumb style
+  };
+  const h = String(html || '').replace(/&amp;/g, '&');
+  scan(h);
+  for (const m of h.matchAll(/[?&]uddg=([^&"'\s]+)/g)) { try { scan(decodeURIComponent(m[1])); } catch { /* skip */ } }          // DuckDuckGo redirect links
+  for (const m of h.matchAll(/[?&]u=a1([A-Za-z0-9_\-]+)/g)) { try { scan(Buffer.from(m[1], 'base64url').toString()); } catch { /* skip */ } } // Bing redirect links
+  for (const m of h.matchAll(/https?%3a%2f%2f[^&"'\s]*tiktok\.com[^&"'\s]+/gi)) { try { scan(decodeURIComponent(m[0])); } catch { /* skip */ } }
+  return [...found];
+}
+async function viaWebSearch(searchUrl, init) {
+  const res = await fetch(searchUrl, { ...init, signal: AbortSignal.timeout(15000) });
+  const html = await res.text();
+  const links = extractTikTokLinks(html).slice(0, MAX_CARDS);
+  if (!links.length) throw new Error(`no TikTok links (HTTP ${res.status}, ${html.length} bytes${/captcha|unusual traffic|verify you are/i.test(html) ? ', bot-check page' : ''})`);
+  return Promise.all(links.map(async (url) => {
+    try {
+      const o = await getJson(`https://www.tiktok.com/oembed?url=${encodeURIComponent(url)}`, { headers: BROWSER });
+      return { url, title: o.title, author: o.author_name, handle: o.author_unique_id, thumbnail: o.thumbnail_url };
+    } catch { return { url }; } // keep the link even if its preview could not be read
+  }));
+}
+const WEB_HEADERS = { 'user-agent': UA, accept: 'text/html,application/xhtml+xml', 'accept-language': 'en-US,en;q=0.9' };
+const q1 = encodeURIComponent;
+
+// Providers are tried in order until one returns videos. The free public APIs change or die often (several already did),
+// so for a reliable setup set ONE of these in Render:
+//   TIKTOK_RAPIDAPI_KEY  = your RapidAPI key (subscribe to "TikTok Scraper" by tikwm on rapidapi.com, the free plan is enough)
+//   TIKTOK_SEARCH_URL    = any JSON search API, with {q} where the words go
+const PROVIDERS = [
+  ['tikwm', async (q) => {
+    const j = await getJson('https://www.tikwm.com/api/feed/search', { method: 'POST', headers: { ...BROWSER, 'content-type': 'application/x-www-form-urlencoded', origin: 'https://www.tikwm.com', referer: 'https://www.tikwm.com/' }, body: form(q) });
+    if (j.code !== 0) throw new Error(j.msg || 'tikwm refused');
+    return pick(j);
+  }],
+  ['davidcyril', async (q) => pick(await getJson(`https://apis.davidcyriltech.my.id/search/tiktok?query=${q1(q)}`, { headers: BROWSER }))],
+  ['bing', (q) => viaWebSearch(`https://www.bing.com/search?q=${q1(`site:tiktok.com ${q}`)}&count=30&setlang=en`, { headers: WEB_HEADERS })]
+];
+if (process.env.TIKTOK_SEARCH_URL) {
+  // Paste the URL from any search API's "Code snippet" and put {q} where the words go. For rapidapi.com URLs the key and host headers are added for you.
+  PROVIDERS.unshift(['custom', async (q) => {
+    const url = process.env.TIKTOK_SEARCH_URL.trim().replace('{q}', q1(q));
+    const headers = { ...BROWSER };
+    try {
+      const host = new URL(url).hostname;
+      if (/rapidapi\.com$/i.test(host) && process.env.TIKTOK_RAPIDAPI_KEY) { headers['x-rapidapi-key'] = process.env.TIKTOK_RAPIDAPI_KEY.trim(); headers['x-rapidapi-host'] = host; }
+    } catch { /* bad URL: the request below reports it */ }
+    const j = await getJson(url, { headers });
+    if (j?.message && !Array.isArray(j) && !j.data) throw new Error(String(j.message).slice(0, 150));
+    return pick(j);
+  }]);
+}
+if (process.env.TIKTOK_RAPIDAPI_KEY) {
+  const key = () => process.env.TIKTOK_RAPIDAPI_KEY.trim();
+  const rapidJson = (host, path, init = {}) => getJson(`https://${host}${path}`, { ...init, headers: { ...BROWSER, 'x-rapidapi-key': key(), 'x-rapidapi-host': host, ...(init.headers || {}) } });
+  const check = (j) => {
+    if (j?.message && !j.data) throw new Error(`RapidAPI says: ${String(j.message).slice(0, 150)}`); // e.g. "You are not subscribed to this API"
+    if (j?.code !== undefined && j.code !== 0) throw new Error(`code ${j.code}: ${String(j.msg || '').slice(0, 120)}`);
+    return pick(j);
+  };
+  // "TikTok Scraper" (host tiktok-scraper20, endpoint "Search Videos", parameter `query`). This one goes FIRST.
+  // The exact path is not shown in the playground's Params tab, so a few likely paths are tried and the one that works is remembered.
+  // If none works, open Search Videos -> "Code snippet" on RapidAPI and set TIKTOK_RAPIDAPI_PATH to the path in the URL (e.g. /search/videos).
+  let path20 = null;
+  const PATHS20 = ['/search/videos', '/search/video', '/videos/search', '/video/search', '/search/posts', '/search', '/search-videos', '/search_videos', '/searchVideos',
+    '/api/search/videos', '/api/search/video', '/api/videos/search', '/v1/search/videos', '/v1/videos/search', '/videos', '/search/general', '/search/item', '/search/feed', '/feed/search', '/tiktok/search/videos', '/search/videos/list'];
+  PROVIDERS.unshift(['rapidapi20', async (q) => {
+    const host = 'tiktok-scraper20.p.rapidapi.com';
+    const paths = path20 ? [path20] : [...new Set([process.env.TIKTOK_RAPIDAPI_PATH, ...PATHS20].filter(Boolean))];
+    const errs = [];
+    const results = await Promise.all(paths.map(async (pth) => { // all paths at once; a wrong path answers "Endpoint does not exist" straight away
+      try {
+        const j = await rapidJson(host, `${pth}?query=${q1(q)}`);
+        if (j?.message && !j.data && !Array.isArray(j)) throw new Error(String(j.message).slice(0, 60));
+        const list = pick(j);
+        if (list.length) return { pth, list };
+        errs.push(`${pth}: empty ${JSON.stringify(j).slice(0, 80)}`);
+      } catch (e) { if (!/does not exist/i.test(e?.message || '')) errs.push(`${pth}: ${e?.message || e}`); }
+      return null;
+    }));
+    const hit = results.find(Boolean);
+    if (hit) { path20 = hit.pth; console.log(`rapidapi20 works with path ${hit.pth}`); return hit.list; }
+    throw new Error(errs.length ? errs.join(' ; ') : `no endpoint matched (${paths.length} paths tried) - set TIKTOK_RAPIDAPI_PATH`);
+  }]);
+  // ScrapTik (endpoint "Search Posts", parameter `keyword`). The path/host are guesses, so a few are tried together and the working one is remembered.
+  // If none works, copy the URL from Search Posts -> "Code snippet" into TIKTOK_SEARCH_URL (put {q} instead of the word).
+  let scrap = null;
+  PROVIDERS.unshift(['scraptik', async (q) => {
+    const hosts = ['scraptik.p.rapidapi.com'];
+    const paths = ['/search-posts', '/search-post', '/search/posts', '/search_posts', '/searchPosts', '/search-videos'];
+    const combos = scrap ? [scrap] : hosts.flatMap((h) => paths.map((pth) => [h, pth]));
+    const errs = [];
+    const results = await Promise.all(combos.map(async ([h, pth]) => {
+      try {
+        const j = await rapidJson(h, `${pth}?keyword=${q1(q)}&count=20&offset=0`);
+        if (j?.message && !Array.isArray(j) && !j.search_item_list && !j.data) throw new Error(String(j.message).slice(0, 60));
+        const list = pick(j);
+        if (list.length) return { combo: [h, pth], list };
+        errs.push(`${pth}: empty ${JSON.stringify(j).slice(0, 80)}`);
+      } catch (e) { if (!/does not exist/i.test(e?.message || '')) errs.push(`${pth}: ${e?.message || e}`); }
+      return null;
+    }));
+    const hit = results.find(Boolean);
+    if (hit) { scrap = hit.combo; console.log(`scraptik works with ${hit.combo.join('')}`); return hit.list; }
+    throw new Error(errs.length ? errs.join(' ; ') : 'no ScrapTik endpoint matched - use TIKTOK_SEARCH_URL');
+  }]);
+}
+
+// Search results are remembered for an hour so a button only needs the short video id (no long link in the button, no extra lookup).
+const dlCache = new Map(); // video id -> { url, video, audio, title, at }
+const idOf = (url) => (String(url).match(/\/video\/(\d+)/) || [])[1] || '';
+function remember(list) {
+  const now = Date.now();
+  for (const [k, v] of dlCache) if (now - v.at > 3600e3) dlCache.delete(k);
+  for (const r of list) { const id = idOf(r.url); if (id) dlCache.set(id, { ...r, at: now }); }
+}
+
+const rank = (n) => (n === 'custom' ? 0 : n === 'scraptik' ? 1 : n === 'rapidapi20' ? 2 : 3);
+PROVIDERS.sort((a, b) => rank(a[0]) - rank(b[0])); // your own URL first, then ScrapTik, then tiktok-scraper20
+
+async function searchTikTok(query) {
+  const errors = [];
+  for (const [name, fn] of PROVIDERS) {
+    try {
+      lastRaw = null;
+      const raw = await fn(query);
+      const list = normalize(raw);
+      if (list.length) { console.log(`TikTok search: ${list.length} result(s) via ${name}`); remember(list); return list; }
+      errors.push(`${name}: no results (${JSON.stringify(lastRaw ?? raw)?.slice(0, 200)})`); // shows what the provider actually sent
+    } catch (err) { errors.push(`${name}: ${err?.message || err}`); }
+    await sleep(300);
+  }
+  throw new Error(errors.join(' | '));
+}
+
+const compact = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}K` : String(n || 0));
+
+function textList(results, query) {
+  return [
+    `🔎 *TikTok results for* “${clip(query, 60)}”`, '',
+    ...results.map((r, i) => `*${i + 1}.* ${clip(r.title, 90) || 'TikTok video'}\n   👤 ${clip(r.author, 40)}\n   ${PREFIX}tt ${r.url}`),
+    '', `Copy a line and send it to download.\n${FOOTER_LINE}`
+  ].join('\n');
+}
+
+// Direct download used by the card buttons (no format menu in between). Accepts a video id (from a card) or a TikTok link.
+async function sendDirect(sock, jid, msg, arg, kind, reply) {
+  console.log(`TikTok ${kind} download requested:`, arg);
+  const cached = dlCache.get(String(arg || ''));
+  const url = cached?.url || (/^\d+$/.test(arg || '') ? `https://www.tiktok.com/@user/video/${arg}` : parseUrl(arg, 'tiktok'));
+  if (!url) return reply(`❌ Send a valid TikTok link.\n${NAGS.tiktok}\nExample: ${PREFIX}ttdl <TikTok link>`);
+  await reply(kind === 'audio' ? '⏳ Preparing audio...' : '⏳ Downloading...');
+  try {
+    let buf = null, isAudio = false, title = cached?.title || '';
+    const direct = kind === 'audio' ? (cached?.audio || cached?.video) : cached?.video; // file link that came with the search result
+    if (direct) {
+      try { buf = await fetchBuffer(direct); isAudio = kind === 'audio' && direct === cached.audio; }
+      catch (err) { if (err?.message === 'TOO_BIG') throw err; console.error('Direct file failed, asking tikwm:', err?.message || err); }
+    }
+    if (!buf) {
+      const info = await tikwm(url);
+      title = info.title || title;
+      if (kind === 'audio' && info.audio) { buf = await fetchBuffer(info.audio); isAudio = true; }
+      else buf = await fetchBuffer(info.video, info.headers);
+    }
+    if (kind === 'audio') return await sock.sendMessage(jid, { audio: buf, mimetype: isAudio ? 'audio/mpeg' : 'audio/mp4', ptt: false }, { quoted: msg });
+    return await sock.sendMessage(jid, { video: buf, mimetype: 'video/mp4', caption: `🎬 ${clip(title, 200)}\n\n${FOOTER_LINE}` }, { quoted: msg });
+  } catch (err) {
+    console.error('TikTok direct download error:', err?.message || err);
+    if (err?.message === 'TOO_BIG') return reply(tooBigText());
+    return reply(`❌ Download failed. Try ${PREFIX}tt <link> instead.\n\nමොකක්හරි අවුලක් බං, ආයෙ ට්‍රයි කරපන් 😒`);
+  }
+}
+
+export default [
+  {
+    name: 'tts', aliases: ['ttsearch', 'tiktoksearch'], react: '🔎',
+    async run({ sock, msg, jid, args, reply }) {
+      const query = args.join(' ').trim();
+      if (!query) return reply(`❌ Type something to search.\n\nකෝ සර්ච් කරන්න ඕන දේ ගහපන් බං 😑\nExample: ${PREFIX}tts funny cats`);
+      await reply('🔎 Searching TikTok...');
+      let results;
+      try { results = await searchTikTok(query); }
+      catch (err) {
+        console.error('TikTok search error:', err?.message || err);
+        return reply('❌ TikTok search failed. Try again in a few seconds.\n\nසර්ච් එක අවුල් බං, ආයෙ ට්‍රයි කරපන් 😒');
+      }
+      if (!results.length) return reply(`😕 No TikTok videos found for “${clip(query, 60)}”.`);
+      if (USE_BUTTONS) { // same shared swipe cards as .song
+        try {
+          return await sendCards(sock, jid, {
+            title: `🔎 *TikTok results for* “${clip(query, 60)}”\nSwipe the cards and tap VIDEO or AUDIO`,
+            quoted: msg,
+            cards: results.map((r) => ({
+              image: r.cover,
+              body: [`🎵 ${clip(r.title, 110) || 'TikTok video'}`, r.author ? `👤 ${clip(r.author, 40)}` : null, r.plays ? `▶️ ${compact(r.plays)} views` : null].filter(Boolean).join('\n'),
+              buttons: [qr('🎬 VIDEO', `${PREFIX}ttdl ${idOf(r.url) || r.url}`), qr('🎵 AUDIO', `${PREFIX}ttmp3 ${idOf(r.url) || r.url}`), qr('📂 MORE', `${PREFIX}tt ${r.url}`)]
+            }))
+          });
+        } catch (err) { console.error('TikTok carousel failed, using text list:', err?.message || err); }
+      }
+      return reply(textList(results, query));
+    },
+  },
+  {
+    name: 'ttdl', aliases: ['ttvideo'], react: '🎬',
+    async run({ sock, msg, jid, args, reply }) { return sendDirect(sock, jid, msg, args[0], 'video', reply); },
+  },
+  {
+    name: 'ttmp3', aliases: ['ttaudio'], react: '🎵',
+    async run({ sock, msg, jid, args, reply }) { return sendDirect(sock, jid, msg, args[0], 'audio', reply); },
+  },
+];
